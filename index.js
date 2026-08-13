@@ -46,11 +46,9 @@ async function fetchPatrons() {
   }
 }
 
-  //sorts the patron list alphabetically by name
+  //sorts the patron list alphabetically by name, case-insensitive
   function patreonPledgeSort(obj1, obj2){
-    if(obj1.name > obj2.name) return 1;
-    if(obj1.name < obj2.name) return -1;
-    return 0;
+    return obj1.name.localeCompare(obj2.name, undefined, { sensitivity: 'base' });
   }
 
   app.get('/patreon-data.txt', async (req, res) => {
