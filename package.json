@@ -9,7 +9,6 @@
   "author": "Evan Brandt",
   "license": "ISC",
   "dependencies": {
-    "@twurple/api": "^7.0.7",
     "@twurple/auth": "^7.0.7",
     "axios": "^1.6.8",
     "dotenv": "^17.4.2",
