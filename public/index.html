@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Sub Data Admin</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 640px;
+    margin: 3rem auto;
+    padding: 0 1rem;
+    color: #1a1a1a;
+  }
+  h1 {
+    font-size: 1.3rem;
+  }
+  button {
+    font-size: 1rem;
+    padding: 0.6rem 1.2rem;
+    cursor: pointer;
+    border: 1px solid #444;
+    border-radius: 6px;
+    background: #1a1a1a;
+    color: #fff;
+  }
+  button:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  #last-updated {
+    margin-top: 1rem;
+    font-size: 0.9rem;
+    color: #444;
+  }
+  #sources {
+    margin-top: 1.25rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .source-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    font-size: 0.95rem;
+  }
+  .source-icon {
+    width: 1.1rem;
+    height: 1.1rem;
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .spinner {
+    width: 1rem;
+    height: 1rem;
+    border: 2px solid #ccc;
+    border-top-color: #1a1a1a;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+  .source-row.success .source-icon { color: #1a7f37; }
+  .source-row.error .source-icon { color: #b00020; }
+  .source-row.idle .source-icon { color: #999; }
+
+  #overall-status {
+    margin-top: 1rem;
+    font-size: 0.95rem;
+    font-weight: 600;
+  }
+  #overall-status.success { color: #1a7f37; }
+  #overall-status.error { color: #b00020; }
+
+  pre {
+    margin-top: 1.5rem;
+    padding: 1rem;
+    background: #f4f4f4;
+    border-radius: 6px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  #login-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    max-width: 280px;
+  }
+  /* [hidden] is only an attribute selector, so plain #id{display:flex} rules
+     above/below would otherwise outrank it on specificity and defeat it */
+  #login-panel[hidden],
+  #admin-panel[hidden] {
+    display: none;
+  }
+  #login-panel input {
+    font-size: 1rem;
+    padding: 0.5rem 0.6rem;
+    border: 1px solid #999;
+    border-radius: 6px;
+  }
+  #login-error {
+    color: #b00020;
+    font-size: 0.9rem;
+    min-height: 1.2em;
+  }
+  #admin-panel {
+    display: flex;
+    flex-direction: column;
+  }
+  #logout-btn {
+    align-self: flex-start;
+    margin-top: 2rem;
+    background: transparent;
+    color: #444;
+    border-color: #ccc;
+    font-size: 0.85rem;
+    padding: 0.4rem 0.8rem;
+  }
+</style>
+</head>
+<body>
+  <h1>Sub Data Admin</h1>
+
+  <form id="login-panel" hidden>
+    <p>Enter the admin password to continue.</p>
+    <input type="password" id="login-password" placeholder="Password" autocomplete="current-password" required>
+    <button type="submit" id="login-btn">Login</button>
+    <div id="login-error"></div>
+  </form>
+
+  <div id="admin-panel" hidden>
+    <p>
+      Clicking the button below fetches current subscriber/patron data from the
+      Twitch and Patreon APIs and regenerates
+      <a href="/subs.txt">/subs.txt</a>. That file is only updated here — it is
+      not refreshed automatically.
+    </p>
+
+    <button id="update-btn">Update Sub Data</button>
+
+    <div id="sources">
+      <div class="source-row idle" id="row-twitch">
+        <span class="source-icon" id="icon-twitch">&#9679;</span>
+        <span>Twitch subscribers</span>
+      </div>
+      <div class="source-row idle" id="row-patreon">
+        <span class="source-icon" id="icon-patreon">&#9679;</span>
+        <span>Patreon patrons</span>
+      </div>
+    </div>
+
+    <div id="overall-status"></div>
+    <div id="last-updated"></div>
+    <pre id="preview" hidden></pre>
+
+    <button id="logout-btn">Log out</button>
+  </div>
+
+  <script>
+    const loginPanel = document.getElementById('login-panel');
+    const loginPassword = document.getElementById('login-password');
+    const loginError = document.getElementById('login-error');
+    const adminPanel = document.getElementById('admin-panel');
+    const logoutBtn = document.getElementById('logout-btn');
+
+    const button = document.getElementById('update-btn');
+    const overallStatus = document.getElementById('overall-status');
+    const lastUpdated = document.getElementById('last-updated');
+    const preview = document.getElementById('preview');
+    const rows = {
+      twitch: document.getElementById('row-twitch'),
+      patreon: document.getElementById('row-patreon'),
+    };
+    const icons = {
+      twitch: document.getElementById('icon-twitch'),
+      patreon: document.getElementById('icon-patreon'),
+    };
+
+    function formatTimestamp(iso) {
+      return new Date(iso).toLocaleString();
+    }
+
+    function setRowState(key, state, label) {
+      const row = rows[key];
+      const icon = icons[key];
+      row.classList.remove('idle', 'pending', 'success', 'error');
+      row.classList.add(state);
+
+      if (state === 'pending') {
+        icon.innerHTML = '';
+        icon.appendChild(Object.assign(document.createElement('span'), { className: 'spinner' }));
+      } else if (state === 'success') {
+        icon.textContent = '✔'; // checkmark
+      } else if (state === 'error') {
+        icon.textContent = '✖'; // x
+      } else {
+        icon.textContent = '●'; // idle dot
+      }
+
+      if (label) {
+        row.title = label;
+      } else {
+        row.removeAttribute('title');
+      }
+    }
+
+    async function loadStatus() {
+      try {
+        const res = await fetch('/subs-status');
+        const data = await res.json();
+        lastUpdated.textContent = data.updatedAt
+          ? `Last updated: ${formatTimestamp(data.updatedAt)}`
+          : 'Never updated yet.';
+      } catch (err) {
+        lastUpdated.textContent = 'Could not load status.';
+      }
+    }
+
+    async function loadPreview() {
+      try {
+        const res = await fetch('/subs.txt');
+        if (!res.ok) return;
+        preview.textContent = await res.text();
+        preview.hidden = false;
+      } catch (err) {
+        // preview is a nice-to-have; ignore failures
+      }
+    }
+
+    // fetches one source, updating its row's spinner/check/x as it resolves.
+    // resolves to the formatted string on success, or null on failure.
+    async function updateSource(key, endpoint) {
+      setRowState(key, 'pending');
+      try {
+        const res = await fetch(endpoint, { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Request failed');
+        setRowState(key, 'success');
+        return data.formatted;
+      } catch (err) {
+        setRowState(key, 'error', err.message);
+        return null;
+      }
+    }
+
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      overallStatus.textContent = '';
+      overallStatus.classList.remove('success', 'error');
+      preview.hidden = true;
+
+      const [twitch, patreon] = await Promise.all([
+        updateSource('twitch', '/update-subs/twitch'),
+        updateSource('patreon', '/update-subs/patreon'),
+      ]);
+
+      if (twitch === null || patreon === null) {
+        overallStatus.textContent = 'Update failed — subs.txt was not changed.';
+        overallStatus.classList.add('error');
+        button.disabled = false;
+        return;
+      }
+
+      try {
+        const res = await fetch('/update-subs/finalize', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ twitch, patreon }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to save');
+
+        overallStatus.textContent = 'Both sources updated — subs.txt regenerated.';
+        overallStatus.classList.add('success');
+        lastUpdated.textContent = `Last updated: ${formatTimestamp(data.updatedAt)}`;
+        await loadPreview();
+      } catch (err) {
+        overallStatus.textContent = `Error saving data: ${err.message}`;
+        overallStatus.classList.add('error');
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    function showAdminPanel() {
+      loginPanel.hidden = true;
+      adminPanel.hidden = false;
+      loadStatus();
+      loadPreview();
+    }
+
+    function showLoginPanel() {
+      adminPanel.hidden = true;
+      loginPanel.hidden = false;
+      loginPassword.value = '';
+      loginPassword.focus();
+    }
+
+    loginPanel.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const loginBtn = document.getElementById('login-btn');
+      loginBtn.disabled = true;
+      loginError.textContent = '';
+      try {
+        const res = await fetch('/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: loginPassword.value }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Login failed');
+        showAdminPanel();
+      } catch (err) {
+        loginError.textContent = err.message;
+      } finally {
+        loginBtn.disabled = false;
+      }
+    });
+
+    logoutBtn.addEventListener('click', async () => {
+      try {
+        await fetch('/logout', { method: 'POST' });
+      } finally {
+        showLoginPanel();
+      }
+    });
+
+    // on load, check whether we already have an authenticated session
+    // (e.g. page refresh) before deciding which panel to show
+    (async () => {
+      try {
+        const res = await fetch('/session');
+        const data = await res.json();
+        if (data.authenticated) {
+          showAdminPanel();
+          return;
+        }
+      } catch (err) {
+        // fall through to showing the login form
+      }
+      showLoginPanel();
+    })();
+  </script>
+</body>
+</html>

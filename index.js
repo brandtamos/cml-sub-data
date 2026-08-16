@@ -1,8 +1,10 @@
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const axios = require('axios');
 const express = require('express');
+const session = require('express-session');
 const { RefreshingAuthProvider } = require('@twurple/auth');
 
 // Patreon API v2 credentials — configured via .env (see .env.example)
@@ -24,9 +26,82 @@ const twitchAccessToken = process.env.TWITCH_ACCESS_TOKEN;
 const twitchRefreshToken = process.env.TWITCH_REFRESH_TOKEN;
 const twitchBroadcasterLogin = process.env.TWITCH_BROADCASTER_LOGIN || 'tomthinks';
 
+// Password that gates the admin UI's update actions — configured via .env.
+// The admin page itself is static and always loads, but it shows a login form
+// until this password is entered; the API routes it calls enforce the real check.
+const adminPassword = process.env.ADMIN_PASSWORD;
+if (!adminPassword) {
+  console.warn(
+    'ADMIN_PASSWORD is not set — the "Update Sub Data" admin page will refuse all logins ' +
+    'until it is set in .env.'
+  );
+}
+
 //set up web server
 const app = express();
 const PORT = process.env.PORT || 3002; //updated to 3002, to prevent conflict with messBot
+
+//the combined sub/pledge listing is only regenerated when the "Update Sub Data"
+//button on the admin UI is clicked (see POST /update-subs below) — /subs.txt just
+//serves whatever was last written here, rather than hitting the APIs on every request
+const dataDir = path.join(__dirname, 'data');
+const subsFilePath = path.join(dataDir, 'subs.txt');
+fs.mkdirSync(dataDir, { recursive: true });
+
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+//session secret is generated fresh on every process start — simplest option since it
+//just means existing admin logins are invalidated on restart, which is fine for this tool
+app.use(session({
+  secret: crypto.randomBytes(32).toString('hex'),
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    sameSite: 'lax',
+    maxAge: 12 * 60 * 60 * 1000, // 12 hours
+  },
+}));
+
+//compares candidate to adminPassword in constant time to avoid leaking length/content via timing
+function isCorrectPassword(candidate) {
+  if (!adminPassword || typeof candidate !== 'string') return false;
+  const candidateBuf = Buffer.from(candidate);
+  const passwordBuf = Buffer.from(adminPassword);
+  if (candidateBuf.length !== passwordBuf.length) return false;
+  return crypto.timingSafeEqual(candidateBuf, passwordBuf);
+}
+
+//protects the admin update routes — the page itself is static/public, but actually
+//triggering API calls and rewriting subs.txt requires a logged-in session
+function requireAuth(req, res, next) {
+  if (req.session && req.session.authenticated) {
+    next();
+    return;
+  }
+  res.status(401).json({ error: 'Not authenticated' });
+}
+
+app.get('/session', (req, res) => {
+  res.json({ authenticated: !!(req.session && req.session.authenticated) });
+});
+
+app.post('/login', (req, res) => {
+  const { password } = req.body || {};
+  if (!isCorrectPassword(password)) {
+    res.status(401).json({ error: 'Incorrect password' });
+    return;
+  }
+  req.session.authenticated = true;
+  res.json({ success: true });
+});
+
+app.post('/logout', (req, res) => {
+  req.session.destroy(() => {
+    res.json({ success: true });
+  });
+});
 
 //this maps tier IDs to the placeholder tom needs for displaying the tiers next to names
 const patreonSubLevelMap = new Map([
@@ -242,22 +317,85 @@ async function fetchPatrons() {
     }
 });
 
-  app.get('/subs.txt', async (req, res) => {
-    try {
-      const [formattedTwitchSubs, formattedPatreonSubs] = await Promise.all([
-        getFormattedTwitchSubs(),
-        getFormattedPatreonSubs(),
-      ]);
-
-      const formattedSubs = `[twitch subs]\r\n${formattedTwitchSubs}\r\n[patreon subs]\r\n${formattedPatreonSubs}`;
-
+  app.get('/subs.txt', (req, res) => {
+    fs.readFile(subsFilePath, 'utf8', (error, data) => {
+      if (error) {
+        if (error.code === 'ENOENT') {
+          res.status(404).send('No sub data yet — click "Update Sub Data" on the admin page to generate it.');
+          return;
+        }
+        console.error('Failed to read subs.txt:', error);
+        res.status(500).json({ error: 'Failed to read data' });
+        return;
+      }
       res.set('Content-Type', 'text/plain');
-      res.send(formattedSubs);
-    } catch (error) {
-      console.error('Failed to fetch combined subscriber data:', error);
-      res.status(500).json({ error: 'Failed to fetch data' });
+      res.send(data);
+    });
+  });
+
+  //status for the admin page: when the static subs.txt was last generated, if ever
+  app.get('/subs-status', (req, res) => {
+    fs.stat(subsFilePath, (error, stats) => {
+      if (error) {
+        if (error.code === 'ENOENT') {
+          res.json({ updatedAt: null });
+          return;
+        }
+        console.error('Failed to stat subs.txt:', error);
+        res.status(500).json({ error: 'Failed to read status' });
+        return;
+      }
+      res.json({ updatedAt: stats.mtime.toISOString() });
+    });
+  });
+
+  //the admin page calls these two independently (in parallel) so it can show a
+  //separate spinner/checkmark per API as each one finishes, rather than one
+  //spinner for the combined request
+  app.post('/update-subs/twitch', requireAuth, async (req, res) => {
+    if (!twitchAuthProvider || !twitchBroadcasterId) {
+      res.status(503).json({ error: 'Twitch integration is not configured.' });
+      return;
     }
-});
+
+    try {
+      const formatted = await getFormattedTwitchSubs();
+      res.json({ success: true, formatted });
+    } catch (error) {
+      console.error('Failed to fetch Twitch subscribers:', error);
+      res.status(500).json({ error: 'Failed to fetch Twitch data' });
+    }
+  });
+
+  app.post('/update-subs/patreon', requireAuth, async (req, res) => {
+    try {
+      const formatted = await getFormattedPatreonSubs();
+      res.json({ success: true, formatted });
+    } catch (error) {
+      console.error('Failed to fetch patrons:', error);
+      res.status(500).json({ error: 'Failed to fetch Patreon data' });
+    }
+  });
+
+  //once the admin page has both formatted strings in hand, it posts them here
+  //to be combined (in the same format /subs.txt has always used) and written
+  //to disk as the new static subs.txt
+  app.post('/update-subs/finalize', requireAuth, (req, res) => {
+    const { twitch, patreon } = req.body || {};
+    if (typeof twitch !== 'string' || typeof patreon !== 'string') {
+      res.status(400).json({ error: 'Missing twitch or patreon formatted data' });
+      return;
+    }
+
+    const formattedSubs = `[twitch subs]\r\n${twitch}\r\n[patreon subs]\r\n${patreon}`;
+    try {
+      fs.writeFileSync(subsFilePath, formattedSubs);
+      res.json({ success: true, updatedAt: new Date().toISOString() });
+    } catch (error) {
+      console.error('Failed to write subs.txt:', error);
+      res.status(500).json({ error: 'Failed to write data' });
+    }
+  });
 
   //start webserver
   initTwitch().finally(() => {
