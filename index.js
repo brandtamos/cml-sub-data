@@ -397,6 +397,24 @@ async function fetchPatrons() {
     }
   });
 
+  //unauthenticated GET equivalent of the admin page's "Update Sub Data" button —
+  //fetches both sources and regenerates subs.txt in one request, no login required
+  app.get('/update', async (req, res) => {
+    try {
+      const [twitch, patreon] = await Promise.all([
+        twitchAuthProvider && twitchBroadcasterId ? getFormattedTwitchSubs() : Promise.resolve(''),
+        getFormattedPatreonSubs(),
+      ]);
+
+      const formattedSubs = `[twitch subs]\r\n${twitch}\r\n[patreon subs]\r\n${patreon}`;
+      fs.writeFileSync(subsFilePath, formattedSubs);
+      res.json({ success: true, updatedAt: new Date().toISOString() });
+    } catch (error) {
+      console.error('Failed to update subs.txt:', error);
+      res.status(500).json({ error: 'Failed to update data' });
+    }
+  });
+
   //start webserver
   initTwitch().finally(() => {
     app.listen(PORT, () => {
